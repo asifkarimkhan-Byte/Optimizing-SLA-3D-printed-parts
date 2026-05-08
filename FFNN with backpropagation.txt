@@ -1,0 +1,155 @@
+import pandas as pd
+import numpy as np
+import torch
+torch.manual_seed(42)
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+
+
+data = pd.read_excel('processed data 2.xlsx')
+X = data[['Specimen Direction', 'Deposition Layer Thickness (mm)', 'Orientation (⁰)', 'Post Processing (min)']].values
+y = data['Ultimate Tensile strength'].values.reshape(-1, 1)
+
+feature_names = ['Specimen Direction', 'Deposition Layer Thickness (mm)', 'Orientation (⁰)', 'Post Processing (min)']
+
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+
+X_scaled = scaler_X.fit_transform(X)
+y_scaled = scaler_y.fit_transform(y).flatten()
+
+
+X_temp, X_test, y_temp, y_test = train_test_split(X_scaled, y_scaled, test_size=0.1, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.1, random_state=42)
+
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+y_val_tensor = torch.tensor(y_val, dtype=torch.float32).view(-1, 1)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_test_tensor = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+
+class BaseRegressorA(nn.Module):
+    def __init__(self, input_dim):
+        super(BaseRegressorA, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class BaseRegressorB(nn.Module):
+    def __init__(self, input_dim):
+        super(BaseRegressorB, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class BaseRegressorC(nn.Module):
+    def __init__(self, input_dim):
+        super(BaseRegressorC, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.LeakyReLU(0.1),
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+def train_model(model, X, y, epochs=200, lr=0.001, verbose=False):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()           # 1. Clear old gradients
+        output = model(X)               # 2. Forward pass
+        loss = criterion(output, y)     # 3. Compute loss
+        loss.backward()                 # 4. Backpropagation (gradients calculated)
+        optimizer.step()                # 5. Update weights
+
+        if verbose and (epoch+1) % 50 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.6f}")
+input_dim = X_train.shape[1]
+base_models = [BaseRegressorA(input_dim), BaseRegressorB(input_dim), BaseRegressorC(input_dim)]
+
+for i, model in enumerate(base_models, 1):
+    print(f"\nTraining Base Model {i}...")
+    train_model(model, X_train_tensor, y_train_tensor, epochs=300, lr=0.001, verbose=True)
+
+
+with torch.no_grad():
+    train_preds = torch.cat([m(X_train_tensor) for m in base_models], dim=1)
+    val_preds = torch.cat([m(X_val_tensor) for m in base_models], dim=1)
+    test_preds = torch.cat([m(X_test_tensor) for m in base_models], dim=1)
+class MetaRegressor(nn.Module):
+    def __init__(self, input_dim):
+        super(MetaRegressor, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+meta_model = MetaRegressor(len(base_models))
+
+print("\nTraining Meta Model...")
+train_model(meta_model, train_preds, y_train_tensor, epochs=500, lr=0.001, verbose=True)
+
+with torch.no_grad():
+    final_train_pred = scaler_y.inverse_transform(meta_model(train_preds).numpy().reshape(-1, 1)).flatten()
+    final_val_pred = scaler_y.inverse_transform(meta_model(val_preds).numpy().reshape(-1, 1)).flatten()
+    final_test_pred = scaler_y.inverse_transform(meta_model(test_preds).numpy().reshape(-1, 1)).flatten()
+
+    y_train_orig = scaler_y.inverse_transform(y_train_tensor.numpy().reshape(-1, 1)).flatten()
+    y_val_orig = scaler_y.inverse_transform(y_val_tensor.numpy().reshape(-1, 1)).flatten()
+    y_test_orig = scaler_y.inverse_transform(y_test_tensor.numpy().reshape(-1, 1)).flatten()
+
+    print("\nPerformance Metrics:")
+    print("Train R²:", r2_score(y_train_orig, final_train_pred))
+
+def compute_metrics(y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    return rmse, mae
+
+train_rmse, train_mae = compute_metrics(y_train_orig, final_train_pred)
+val_rmse, val_mae = compute_metrics(y_val_orig, final_val_pred)
+test_rmse, test_mae = compute_metrics(y_test_orig, final_test_pred)
+
+print(f"Train RMSE: {train_rmse:.2f}, MAE: {train_mae:.2f}")
+combined_actual = np.concatenate([y_train_orig, y_test_orig, y_val_orig])
+combined_pred = np.concatenate([final_train_pred, final_test_pred, final_val_pred])
+m, b = np.polyfit(combined_actual, combined_pred, 1)
+best_fit = m * combined_actual + b
+
+plt.figure(figsize=(10, 6))
+plt.scatter(y_train_orig, final_train_pred, color='blue', alpha=0.5, label='Train')
+plt.scatter(y_test_orig, final_test_pred, color='red', alpha=0.5, label='Test')
+plt.scatter(y_val_orig, final_val_pred, color='green', alpha=0.5, label='Validation')
+plt.plot(combined_actual, best_fit, color='black')
+plt.xlabel('Actual Ultimate Tensile Strength (MPa)')
+plt.ylabel('Predicted Ultimate Tensile Strength (MPa)')
+plt.legend()
+plt.grid(False)
+plt.savefig('predicted_vs_actual_dl_stacked_diverse_backprop.png', dpi=300)
+plt.show()
